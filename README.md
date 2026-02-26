@@ -55,16 +55,16 @@ A random animation is selected each time you run stardust.
 
 <table>
 <tr>
-<td align="center"><strong>Spiral Galaxy</strong><br><img src="assets/spiral-galaxy.png" width="400"></td>
-<td align="center"><strong>Nebula</strong><br><img src="assets/nebula.png" width="400"></td>
+<td align="center"><strong>Spiral Galaxy</strong><br><img src="assets/spiral-galaxy.gif" width="400"></td>
+<td align="center"><strong>Nebula</strong><br><img src="assets/nebula.gif" width="400"></td>
 </tr>
 <tr>
-<td align="center"><strong>Meteor Shower</strong><br><img src="assets/meteor-shower.png" width="400"></td>
-<td align="center"><strong>Pulsar</strong><br><img src="assets/pulsar.png" width="400"></td>
+<td align="center"><strong>Meteor Shower</strong><br><img src="assets/meteor-shower.gif" width="400"></td>
+<td align="center"><strong>Pulsar</strong><br><img src="assets/pulsar.gif" width="400"></td>
 </tr>
 <tr>
-<td align="center"><strong>Aurora</strong><br><img src="assets/aurora.png" width="400"></td>
-<td align="center"><strong>Wormhole</strong><br><img src="assets/wormhole.png" width="400"></td>
+<td align="center"><strong>Aurora</strong><br><img src="assets/aurora.gif" width="400"></td>
+<td align="center"><strong>Wormhole</strong><br><img src="assets/wormhole.gif" width="400"></td>
 </tr>
 </table>
 
