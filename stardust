@@ -27,6 +27,7 @@ import struct
 import fcntl
 import threading
 import json
+import shutil
 
 # ─── Animation Definitions ──────────────────────────────────────────────────
 
@@ -96,19 +97,21 @@ Usage:
   stardust "task" -- cmd [args...]  Wrap a custom command instead
   stardust --help                   Show this help
 
+Options:
+  -a, --animation <name>  Use a specific animation (see --list)
+  -l, --list              List available animations and exit
+  -h, --help              Show this help and exit
+
 Examples:
   stardust "fix the login bug"
   stardust "refactor auth" -- claude --dangerously-skip-permissions
   stardust -- claude --model sonnet
+  stardust -a pulsar "build the API"
 
 Everything before -- is the task description.
 Everything after -- is the command to run (default: claude).
 
-Animations:
-  Spiral Galaxy, Nebula, Meteor Shower, Pulsar, Aurora, Wormhole
-
-A random animation plays when the terminal loses focus.
-Original content is fully preserved on the alternate screen buffer.
+While the overlay is active, press n to cycle to the next animation.
 
 Requirements:
   Python 3.6+, macOS (or any terminal with focus reporting)
@@ -970,24 +973,56 @@ def parse_focus_events(data):
 
 # ─── Argument Parsing ────────────────────────────────────────────────────────
 
+def _anim_name_map():
+    """Build a lowercase name → animation definition lookup."""
+    m = {}
+    for a in ANIMATIONS:
+        m[a['name'].lower()] = a
+        m[a['class'].lower()] = a
+        # Also allow hyphenated: "meteor-shower"
+        m[a['name'].lower().replace(' ', '-')] = a
+    return m
+
+
+def print_animation_list():
+    """Print all available animations with color previews."""
+    print('Available animations:\n')
+    for a in ANIMATIONS:
+        c = a['colors'][0]
+        print(f'  \033[38;5;{c}m\u2726\033[0m  {a["name"]}')
+    print(f'\nUse: stardust -a "{ANIMATIONS[0]["name"].lower()}"')
+
+
 def parse_args(argv):
     """Parse stardust arguments.
 
-    Returns (task, command) where:
-      task    — string task description or None
-      command — list of command + args to exec (default: ['claude'])
-
-    Supports:
-      stardust                              → task=None,  cmd=['claude']
-      stardust "fix bug"                    → task="fix bug", cmd=['claude']
-      stardust "fix bug" -- claude --model  → task="fix bug", cmd=['claude','--model']
-      stardust -- my-cmd --flag             → task=None,  cmd=['my-cmd','--flag']
+    Returns (task, command, anim_choice) where:
+      task        — string task description or None
+      command     — list of command + args to exec (default: ['claude'])
+      anim_choice — animation name string or None (random)
     """
     args = argv[1:]
 
     if '--help' in args or '-h' in args:
         print(HELP_TEXT)
         sys.exit(0)
+
+    if '--list' in args or '-l' in args:
+        print_animation_list()
+        sys.exit(0)
+
+    # Extract --animation / -a value before splitting on --
+    anim_choice = None
+    cleaned = []
+    i = 0
+    while i < len(args):
+        if args[i] in ('--animation', '-a') and i + 1 < len(args):
+            anim_choice = args[i + 1]
+            i += 2
+        else:
+            cleaned.append(args[i])
+            i += 1
+    args = cleaned
 
     if '--' in args:
         sep = args.index('--')
@@ -999,15 +1034,48 @@ def parse_args(argv):
         task = ' '.join(args) if args else None
         command = ['claude']
 
-    return task, command
+    return task, command, anim_choice
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
-    manual_task, command = parse_args(sys.argv)
+    # Python version check
+    if sys.version_info < (3, 6):
+        sys.stderr.write(
+            'stardust requires Python 3.6+. '
+            f'You are running {sys.version.split()[0]}.\n'
+        )
+        sys.exit(1)
 
-    anim_def = random.choice(ANIMATIONS)
+    manual_task, command, anim_choice = parse_args(sys.argv)
+
+    # Validate the command exists before forking
+    if not shutil.which(command[0]):
+        sys.stderr.write(
+            f'stardust: command not found: {command[0]}\n'
+        )
+        if command[0] == 'claude':
+            sys.stderr.write(
+                'Install Claude Code: npm install -g @anthropic-ai/claude-code\n'
+            )
+        sys.exit(127)
+
+    # Select animation
+    if anim_choice:
+        name_map = _anim_name_map()
+        key = anim_choice.lower().strip()
+        if key not in name_map:
+            sys.stderr.write(
+                f'stardust: unknown animation "{anim_choice}"\n'
+                'Run stardust --list to see available animations.\n'
+            )
+            sys.exit(1)
+        anim_def = name_map[key]
+    else:
+        anim_def = random.choice(ANIMATIONS)
+
+    anim_idx = ANIMATIONS.index(anim_def)
     anim_name = anim_def['name']
     anim_cls = ANIM_CLASSES[anim_def['class']]
     primary_color = anim_def['colors'][0]
@@ -1118,6 +1186,20 @@ def main():
                         except ProcessLookupError:
                             break
                     focused = focus_state
+
+                # Cycle animation with 'n' while overlay is active
+                if overlay_active and b'n' in cleaned:
+                    cleaned = cleaned.replace(b'n', b'')
+                    anim_idx = (anim_idx + 1) % len(ANIMATIONS)
+                    anim_def = ANIMATIONS[anim_idx]
+                    anim_cls = ANIM_CLASSES[anim_def['class']]
+                    anim = anim_cls(
+                        anim_def['colors'], manual_task, anim_def['name'],
+                        activity=activity,
+                    )
+                    anim.t = 0.0
+                    anim.start_time = None
+                    anim._size = (0, 0)
 
                 if cleaned:
                     try:

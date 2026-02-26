@@ -10,6 +10,7 @@ Animated terminal overlay for Claude Code. When you switch away from your termin
 - **Fade-in transitions** — elements appear spatially distributed over 300ms
 - **Tab title** — sets your terminal tab title to show the current task
 - **Alternate screen buffer** — original terminal content is fully preserved
+- **Pick your animation** — `--animation pulsar` or press `n` to cycle while active
 - **Zero dependencies** — pure Python 3, no pip install needed
 
 ## Install
@@ -40,18 +41,26 @@ stardust
 # Pass a task description
 stardust "fix the login bug"
 
+# Pick a specific animation
+stardust -a pulsar "build the API"
+
 # Wrap a custom command
 stardust "refactor auth" -- claude --dangerously-skip-permissions
 
 # Use a different model
 stardust "write tests" -- claude --model sonnet
+
+# List available animations
+stardust --list
 ```
 
 Everything before `--` is the task description. Everything after `--` is the command to run (defaults to `claude`).
 
+While the overlay is active, press **n** to cycle to the next animation.
+
 ## Animations
 
-A random animation is selected each time you run stardust.
+A random animation is selected each time, or pick one with `stardust -a <name>`.
 
 <table>
 <tr>
