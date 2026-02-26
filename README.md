@@ -1,6 +1,27 @@
-# ✦ stardust
+<p align="center">
+  <h1 align="center">✦ stardust</h1>
+  <p align="center">
+    <strong>Animated terminal overlay for Claude Code</strong>
+  </p>
+  <p align="center">
+    When you switch away from your terminal tab, stardust takes over with a mesmerizing space animation.<br>
+    Switch back and everything is exactly where you left it.
+  </p>
+  <p align="center">
+    <a href="#install"><img src="https://img.shields.io/badge/install-curl%20%7C%20bash-blue?style=flat-square" alt="Install"></a>
+    <img src="https://img.shields.io/badge/python-3.6%2B-yellow?style=flat-square&logo=python&logoColor=white" alt="Python 3.6+">
+    <img src="https://img.shields.io/badge/dependencies-zero-green?style=flat-square" alt="Zero dependencies">
+    <img src="https://img.shields.io/badge/license-MIT-gray?style=flat-square" alt="MIT License">
+  </p>
+</p>
 
-Animated terminal overlay for Claude Code. When you switch away from your terminal tab, stardust takes over with a mesmerizing space animation. Switch back and everything is exactly where you left it.
+<br>
+
+<p align="center">
+  <img src="assets/spiral-galaxy.gif" width="600">
+</p>
+
+<br>
 
 ## Features
 
@@ -18,13 +39,13 @@ Animated terminal overlay for Claude Code. When you switch away from your termin
 **Quick install:**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/vanshgutgutia/stardust/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/vgutgutia/stardust/main/install.sh | bash
 ```
 
 **Manual install:**
 
 ```sh
-git clone https://github.com/vanshgutgutia/stardust.git
+git clone https://github.com/vgutgutia/stardust.git
 cd stardust
 chmod +x stardust
 cp stardust ~/.local/bin/
@@ -93,4 +114,4 @@ A random animation is selected each time, or pick one with `stardust -a <name>`.
 
 ## License
 
-MIT — Vansh Gutgutia
+MIT — [Vansh Gutgutia](https://github.com/vgutgutia)
