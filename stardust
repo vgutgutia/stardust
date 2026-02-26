@@ -477,21 +477,21 @@ class SpiralGalaxy(BaseAnimation):
             return
         self._size = (h, w)
         render_h = h - 2
-        n = min(80, w * render_h // 25)
+        n = min(140, w * render_h // 15)
 
         self.stars = []
         max_r = min(w * 0.4, render_h * 0.8)
         for _ in range(n):
             arm = random.randint(0, 2)
             r = random.expovariate(1 / (max_r * 0.4))
-            a = arm * (2 * math.pi / 3) + r * 0.35 + random.gauss(0, 0.25)
-            char = random.choice(['\u00b7', '.', '*', '+'])
+            a = arm * (2 * math.pi / 3) + r * 0.35 + random.gauss(0, 0.3)
+            char = random.choice(['\u00b7', '.', '*', '+', '\u2726'])
             self.stars.append((r, a, char, random.random(), max_r))
 
         self.bg_stars = [
             (random.randint(0, render_h - 1), random.randint(0, w - 1),
-             random.choice(['\u00b7', '.']))
-            for _ in range(min(25, w * render_h // 80))
+             random.choice(['\u00b7', '.', '+']))
+            for _ in range(min(40, w * render_h // 50))
         ]
 
     def _render_content(self, h, w, grid):
@@ -499,7 +499,7 @@ class SpiralGalaxy(BaseAnimation):
         cx, cy = w // 2, render_h // 2
         c_core, c_arm, c_outer = self.colors[0], self.colors[1], self.colors[2]
 
-        # Sparse background
+        # Background stars
         for row, col, ch in self.bg_stars:
             if 0 <= row < render_h and 0 <= col < w:
                 grid[(row, col)] = f'\033[2;38;5;{c_outer}m{ch}\033[0m'
@@ -519,17 +519,23 @@ class SpiralGalaxy(BaseAnimation):
                 else:
                     cc = c_outer
                 twinkle = 0.5 + 0.5 * math.sin(self.t * 2 + bright * 10)
-                if twinkle > 0.75 and bright > 0.6:
+                if twinkle > 0.6 and bright > 0.4:
                     grid[(y, x)] = f'\033[1;38;5;{cc}m{char}\033[0m'
                 else:
-                    grid[(y, x)] = f'\033[2;38;5;{cc}m{char}\033[0m'
+                    grid[(y, x)] = f'\033[38;5;{cc}m{char}\033[0m'
 
-        # Bright core: ✦ center + a few nearby *
+        # Bright core: ✦ center + surrounding glow
         grid[(cy, cx)] = f'\033[1;38;5;{c_core}m\u2726\033[0m'
-        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1), (0, -2), (0, 2)]:
-            ny, nx = cy + dy, cx + dx
-            if 0 <= ny < render_h and 0 <= nx < w:
-                grid[(ny, nx)] = f'\033[1;38;5;{c_core}m*\033[0m'
+        for dy in range(-1, 2):
+            for dx in range(-3, 4):
+                if dy == 0 and dx == 0:
+                    continue
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < render_h and 0 <= nx < w:
+                    if abs(dx) <= 1 and abs(dy) <= 1:
+                        grid[(ny, nx)] = f'\033[1;38;5;{c_core}m*\033[0m'
+                    else:
+                        grid[(ny, nx)] = f'\033[38;5;{c_core}m+\033[0m'
 
 
 # ─── 2. Nebula ──────────────────────────────────────────────────────────────
@@ -548,15 +554,15 @@ class Nebula(BaseAnimation):
         self._size = (h, w)
         render_h = h - 2
         self.blobs = []
-        for _ in range(random.randint(5, 8)):
-            rx = random.uniform(w * 0.06, w * 0.18)
-            ry = random.uniform(render_h * 0.08, render_h * 0.22)
-            n_pts = random.randint(25, 55)
+        for _ in range(random.randint(6, 10)):
+            rx = random.uniform(w * 0.08, w * 0.22)
+            ry = random.uniform(render_h * 0.1, render_h * 0.28)
+            n_pts = random.randint(45, 90)
             points = []
             for _ in range(n_pts):
                 dx = random.gauss(0, rx * 0.5)
                 dy = random.gauss(0, ry * 0.5)
-                ch = random.choice(['\u00b7', '.', '\u00b7', '\u00b7', '.'])
+                ch = random.choice(['\u00b7', '.', '\u00b7', '\u00b7', '.', '*'])
                 points.append((dx, dy, ch, random.random()))
             self.blobs.append({
                 'cx': random.uniform(0, w),
@@ -571,7 +577,7 @@ class Nebula(BaseAnimation):
 
         self.bg_stars = [
             (random.randint(0, render_h - 1), random.randint(0, w - 1))
-            for _ in range(min(20, w * render_h // 100))
+            for _ in range(min(30, w * render_h // 70))
         ]
 
     def _render_content(self, h, w, grid):
@@ -599,10 +605,13 @@ class Nebula(BaseAnimation):
                         (dx / max(b['rx'], 1)) ** 2 +
                         (dy / max(b['ry'], 1)) ** 2
                     )
-                    if dist < 1.5:
+                    if dist < 1.8:
                         twinkle = 0.5 + 0.5 * math.sin(
                             self.t * 1.2 + bright * 8)
-                        if dist < 0.4 and twinkle > 0.5:
+                        if dist < 0.5 and twinkle > 0.4:
+                            grid[(pr, pc)] = (
+                                f'\033[1;38;5;{b["color"]}m{ch}\033[0m')
+                        elif dist < 0.8:
                             grid[(pr, pc)] = (
                                 f'\033[38;5;{b["color"]}m{ch}\033[0m')
                         else:
@@ -643,19 +652,20 @@ class MeteorShower(BaseAnimation):
                 if twinkle > 0.4:
                     grid[(row, col)] = f'\033[2;38;5;255m{ch}\033[0m'
 
-        # Spawn new meteors
-        if random.random() < 0.25:
-            self.meteors.append({
-                'x': random.randint(w // 4, w + 5),
-                'y': random.randint(-3, -1),
-                'speed': random.uniform(2.0, 4.0),
-                'length': random.randint(4, 8),
-                'color_idx': random.randint(0, len(self.colors) - 1),
-                'age': 0.0,
-            })
+        # Spawn new meteors — multiple per frame for density
+        for _ in range(random.randint(0, 2)):
+            if random.random() < 0.45:
+                self.meteors.append({
+                    'x': random.randint(w // 6, w + 10),
+                    'y': random.randint(-5, -1),
+                    'speed': random.uniform(1.8, 4.5),
+                    'length': random.randint(6, 12),
+                    'color_idx': random.randint(0, len(self.colors) - 1),
+                    'age': 0.0,
+                })
 
         # Render streaks
-        trail_chars = ['\u2726', '*', '+', '\u00b7', '\u00b7', '.', '.']
+        trail_chars = ['\u2726', '*', '*', '+', '+', '\u00b7', '\u00b7', '.', '.']
         alive = []
         for m in self.meteors:
             m['age'] += 0.04
@@ -671,15 +681,17 @@ class MeteorShower(BaseAnimation):
                     ch = trail_chars[min(i, len(trail_chars) - 1)]
                     ci = min(len(self.colors) - 1, m['color_idx'] + i // 3)
                     cc = self.colors[ci]
-                    if i < 2:
+                    if i < 3:
                         grid[(ty, tx)] = f'\033[1;38;5;{cc}m{ch}\033[0m'
+                    elif i < 5:
+                        grid[(ty, tx)] = f'\033[38;5;{cc}m{ch}\033[0m'
                     else:
                         grid[(ty, tx)] = f'\033[2;38;5;{cc}m{ch}\033[0m'
 
             if visible or m['age'] < 2.5:
                 alive.append(m)
 
-        self.meteors = alive[:40]
+        self.meteors = alive[:60]
 
 
 # ─── 4. Pulsar ───────────────────────────────────────────────────────────────
@@ -779,16 +791,16 @@ class Aurora(BaseAnimation):
             return
         self._size = (h, w)
         render_h = h - 2
-        n_bands = random.randint(3, 5)
+        n_bands = random.randint(4, 6)
         self.bands = []
         for i in range(n_bands):
             self.bands.append({
-                'base_y': render_h * (0.2 + 0.6 * i / max(n_bands - 1, 1)),
+                'base_y': render_h * (0.12 + 0.76 * i / max(n_bands - 1, 1)),
                 'color': self.colors[i % len(self.colors)],
-                'amplitude': random.uniform(1.5, 3.5),
+                'amplitude': random.uniform(2.0, 4.5),
                 'freq': random.uniform(0.03, 0.07),
                 'phase': random.uniform(0, 2 * math.pi),
-                'width': random.uniform(1.5, 3.0),
+                'width': random.uniform(2.5, 4.5),
             })
 
         # Stable background star positions
@@ -829,13 +841,16 @@ class Aurora(BaseAnimation):
                         intensity = max(0, 1.0 - dist)
                         if intensity < 0.1:
                             continue
-                        # Sparse: deterministic noise for stable dot placement
+                        # Deterministic noise for stable dot placement
                         noise = (math.sin(col * 13.7 + row * 7.3 +
                                           self.t * 0.5) * 0.5 + 0.5)
-                        threshold = 0.96 - intensity * 0.1
+                        threshold = 0.88 - intensity * 0.15
                         if noise > threshold:
                             cc = band['color']
-                            if intensity > 0.7:
+                            if intensity > 0.8:
+                                grid[(row, col)] = (
+                                    f'\033[1;38;5;{cc}m\u00b7\033[0m')
+                            elif intensity > 0.5:
                                 grid[(row, col)] = (
                                     f'\033[38;5;{cc}m\u00b7\033[0m')
                             else:
@@ -857,7 +872,7 @@ class Wormhole(BaseAnimation):
             return
         self._size = (h, w)
         self.particles = []
-        for _ in range(min(60, w * h // 25)):
+        for _ in range(min(100, w * h // 15)):
             self.particles.append({
                 'angle': random.uniform(0, 2 * math.pi),
                 'r': random.uniform(0.2, 1.0),
@@ -873,10 +888,10 @@ class Wormhole(BaseAnimation):
         rotation = self.t * 0.3
 
         # Concentric ellipses drawn with spaced · dots
-        n_rings = 7
+        n_rings = 10
         for ring_i in range(n_rings):
             frac = (ring_i + 1) / n_rings
-            scale = 0.12 + 0.88 * frac
+            scale = 0.08 + 0.92 * frac
             rx = max_rx * scale
             ry = max_ry * scale
             rot = rotation + ring_i * 0.12
@@ -885,7 +900,7 @@ class Wormhole(BaseAnimation):
             cc = self.colors[ci]
             fade = 0.3 + 0.7 * frac
 
-            n_points = max(12, int(24 * scale))
+            n_points = max(16, int(36 * scale))
             for j in range(n_points):
                 a = 2 * math.pi * j / n_points + rot
                 ex = rx * math.cos(a)

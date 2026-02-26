@@ -200,20 +200,31 @@ def render_gif(anim_def, output_path):
         grid = {}
         anim._render_content(h, w, grid)
 
-    # Record GIF frames
+    # Record GIF frames — reset time for fade-in at start of recording
     frames = []
     total_gif_frames = int(GIF_DURATION * GIF_FPS)
     sim_steps_per_gif_frame = max(1, int(gif_dt / sim_dt))
 
-    t = WARMUP
+    # Reset animation time so we capture the fade-in (0→0.3s)
+    # but keep all accumulated state (meteors, rings, particles)
+    rec_t = 0.0
+
     for frame_i in range(total_gif_frames):
         for _ in range(sim_steps_per_gif_frame):
-            t += sim_dt
+            rec_t += sim_dt
             anim.start_time = 0.0
-            anim.t = t
+            anim.t = rec_t
             anim._regenerate(h, w)
             grid = {}
             anim._render_content(h, w, grid)
+
+        # Apply fade-in: elements appear spatially over first 0.5s
+        fade = min(1.0, rec_t / 0.5)
+        if fade < 1.0:
+            grid = {
+                (r, c): v for (r, c), v in grid.items()
+                if ((r * 7 + c * 13) % 100) / 100.0 < fade
+            }
 
         img = grid_to_image(grid, anim_def, h, w, font)
         # 256 colors — full GIF palette, much better quality
