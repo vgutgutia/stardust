@@ -2,8 +2,6 @@
 
 Animated terminal overlay for Claude Code. When you switch away from your terminal tab, stardust takes over with a mesmerizing space animation. Switch back and everything is exactly where you left it.
 
-<!-- GIF here -->
-
 ## Features
 
 - **6 unique animations** — Spiral Galaxy, Nebula, Meteor Shower, Pulsar, Aurora, Wormhole
@@ -53,16 +51,22 @@ Everything before `--` is the task description. Everything after `--` is the com
 
 ## Animations
 
-| Animation | Style |
-|---|---|
-| Spiral Galaxy | Three-arm dot spiral with bright ✦ core |
-| Nebula | Drifting gaussian point clouds |
-| Meteor Shower | Shooting-star streaks with fading trails |
-| Pulsar | Expanding rings with rotating beam |
-| Aurora | Wavy horizontal bands of sparse dots |
-| Wormhole | Concentric ellipses with spiraling particles |
-
 A random animation is selected each time you run stardust.
+
+<table>
+<tr>
+<td align="center"><strong>Spiral Galaxy</strong><br><img src="assets/spiral-galaxy.png" width="400"></td>
+<td align="center"><strong>Nebula</strong><br><img src="assets/nebula.png" width="400"></td>
+</tr>
+<tr>
+<td align="center"><strong>Meteor Shower</strong><br><img src="assets/meteor-shower.png" width="400"></td>
+<td align="center"><strong>Pulsar</strong><br><img src="assets/pulsar.png" width="400"></td>
+</tr>
+<tr>
+<td align="center"><strong>Aurora</strong><br><img src="assets/aurora.png" width="400"></td>
+<td align="center"><strong>Wormhole</strong><br><img src="assets/wormhole.png" width="400"></td>
+</tr>
+</table>
 
 ## How It Works
 
