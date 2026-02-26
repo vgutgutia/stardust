@@ -1,0 +1,1161 @@
+#!/usr/bin/env python3
+"""stardust - Animated terminal overlay for Claude Code.
+
+Runs Claude Code inside a PTY proxy. When the terminal tab loses focus,
+switches to the alternate screen buffer and displays one of 6 unique
+animations. When focus returns, switches back — original content fully
+preserved.
+
+Requires a terminal with focus reporting (e.g. Terminal.app on macOS).
+
+Usage: stardust ["task description"]
+       stardust ["task description"] -- <command> [args...]
+       stardust --help
+"""
+
+import os
+import sys
+import pty
+import tty
+import termios
+import select
+import signal
+import math
+import random
+import time
+import struct
+import fcntl
+import threading
+import json
+
+# ─── Animation Definitions ──────────────────────────────────────────────────
+
+ANIMATIONS = [
+    {
+        'name': 'Spiral Galaxy',
+        'colors': [255, 51, 33],       # white core → cyan arms → blue outer
+        'class': 'SpiralGalaxy',
+    },
+    {
+        'name': 'Nebula',
+        'colors': [213, 135, 51, 33],   # pink → violet → cyan → blue
+        'class': 'Nebula',
+    },
+    {
+        'name': 'Meteor Shower',
+        'colors': [220, 208, 196],      # gold → orange → red
+        'class': 'MeteorShower',
+    },
+    {
+        'name': 'Pulsar',
+        'colors': [46, 118, 255],       # green → lime → white
+        'class': 'Pulsar',
+    },
+    {
+        'name': 'Aurora',
+        'colors': [46, 51, 135, 213],   # green → cyan → violet → pink
+        'class': 'Aurora',
+    },
+    {
+        'name': 'Wormhole',
+        'colors': [135, 99, 63, 33],    # violet → purple → indigo → blue
+        'class': 'Wormhole',
+    },
+]
+
+
+def get_term_size():
+    try:
+        data = fcntl.ioctl(1, termios.TIOCGWINSZ, b'\x00' * 8)
+        return struct.unpack('HH', data[:4])
+    except Exception:
+        return 24, 80
+
+
+def copy_term_size(src_fd, dst_fd):
+    try:
+        size = fcntl.ioctl(src_fd, termios.TIOCGWINSZ, b'\x00' * 8)
+        fcntl.ioctl(dst_fd, termios.TIOCSWINSZ, size)
+    except Exception:
+        pass
+
+
+def fmt_elapsed(seconds):
+    m, s = divmod(int(seconds), 60)
+    if m > 0:
+        return f'{m}m {s:02d}s'
+    return f'{s}s'
+
+
+HELP_TEXT = """\
+✦ stardust — Animated terminal overlay for Claude Code
+
+Usage:
+  stardust                          Run claude with animations
+  stardust "task description"       Pass a task to claude
+  stardust "task" -- cmd [args...]  Wrap a custom command instead
+  stardust --help                   Show this help
+
+Examples:
+  stardust "fix the login bug"
+  stardust "refactor auth" -- claude --dangerously-skip-permissions
+  stardust -- claude --model sonnet
+
+Everything before -- is the task description.
+Everything after -- is the command to run (default: claude).
+
+Animations:
+  Spiral Galaxy, Nebula, Meteor Shower, Pulsar, Aurora, Wormhole
+
+A random animation plays when the terminal loses focus.
+Original content is fully preserved on the alternate screen buffer.
+
+Requirements:
+  Python 3.6+, macOS (or any terminal with focus reporting)
+"""
+
+
+# ─── Activity Detector ─────────────────────────────────────────────────────
+
+class ActivityDetector:
+    """Detects what Claude Code is currently doing by tailing conversation JSONL.
+
+    Reads the last few entries of the active conversation file and generates
+    human-readable status strings like "Reading file", "Searching codebase",
+    or "Thinking..." based on the latest assistant actions and tool calls.
+    """
+
+    def __init__(self):
+        self._status = None
+        self._lock = threading.Lock()
+        self._running = True
+        self._cwd = os.getcwd()
+        self._project_dir = self._get_project_dir()
+        self._initial_files = set()
+        if self._project_dir and os.path.isdir(self._project_dir):
+            self._initial_files = {
+                f for f in os.listdir(self._project_dir) if f.endswith('.jsonl')
+            }
+        self._tracked_file = None
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def _get_project_dir(self):
+        # Claude encodes /Users/foo as -Users-foo (replace / with -)
+        encoded = self._cwd.replace('/', '-')
+        return os.path.expanduser(f'~/.claude/projects/{encoded}')
+
+    def _poll(self):
+        while self._running:
+            try:
+                self._update_status()
+            except Exception:
+                pass
+            time.sleep(2)
+
+    def _update_status(self):
+        if not self._project_dir or not os.path.isdir(self._project_dir):
+            return
+
+        # Look for a new JSONL file (created after stardust started)
+        if self._tracked_file is None:
+            current_files = {
+                f for f in os.listdir(self._project_dir)
+                if f.endswith('.jsonl')
+            }
+            new_files = current_files - self._initial_files
+            if new_files:
+                best = None
+                best_mtime = 0
+                for f in new_files:
+                    fp = os.path.join(self._project_dir, f)
+                    try:
+                        mt = os.path.getmtime(fp)
+                        if mt > best_mtime:
+                            best_mtime = mt
+                            best = fp
+                    except OSError:
+                        continue
+                if best:
+                    self._tracked_file = best
+
+        if self._tracked_file is None:
+            return
+
+        # Read tail of the file and determine current activity
+        entries = self._read_tail()
+        if not entries:
+            return
+
+        status = self._determine_status(entries)
+        if status:
+            with self._lock:
+                self._status = status
+
+    def _read_tail(self, n_bytes=16384):
+        """Read last n_bytes of the JSONL file and parse entries."""
+        try:
+            with open(self._tracked_file, 'rb') as f:
+                f.seek(0, 2)
+                size = f.tell()
+                start = max(0, size - n_bytes)
+                f.seek(start)
+                data = f.read().decode('utf-8', errors='replace')
+
+            lines = data.strip().split('\n')
+            if start > 0:
+                lines = lines[1:]  # first line may be truncated
+
+            entries = []
+            for line in lines:
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+            return entries
+        except Exception:
+            return []
+
+    def _determine_status(self, entries):
+        """Walk backwards through entries to find the latest actionable status."""
+        for entry in reversed(entries):
+            entry_type = entry.get('type')
+
+            if entry_type == 'assistant':
+                result = self._status_from_assistant(entry)
+                if result:
+                    return result
+
+            elif entry_type == 'progress':
+                result = self._status_from_progress(entry)
+                if result:
+                    return result
+
+            elif entry_type == 'system':
+                if entry.get('subtype') == 'turn_duration':
+                    return 'Waiting for input'
+
+            elif entry_type == 'user':
+                content = entry.get('message', {}).get('content', '')
+                if isinstance(content, list):
+                    for block in content:
+                        if (isinstance(block, dict)
+                                and block.get('type') == 'tool_result'):
+                            return 'Processing results'
+                # Skip raw user messages — we want Claude's activity
+                continue
+
+        return None
+
+    def _status_from_assistant(self, entry):
+        """Extract status from an assistant message entry."""
+        content = entry.get('message', {}).get('content', [])
+        if not isinstance(content, list):
+            return None
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+
+            btype = block.get('type')
+
+            if btype == 'tool_use':
+                return self._status_from_tool(block)
+            elif btype == 'thinking':
+                return 'Thinking\u2026'
+            elif btype == 'text':
+                text = block.get('text', '').strip()
+                if text:
+                    text = ' '.join(text.split())
+                    if len(text) > 50:
+                        text = text[:47] + '\u2026'
+                    return text
+
+        return None
+
+    def _status_from_tool(self, block):
+        """Generate a human-readable status from a tool_use block."""
+        name = block.get('name', '')
+        inp = block.get('input', {})
+
+        if name == 'Read':
+            path = inp.get('file_path', '')
+            base = os.path.basename(path) if path else 'file'
+            return f'Reading {base}'
+
+        elif name == 'Write':
+            path = inp.get('file_path', '')
+            base = os.path.basename(path) if path else 'file'
+            return f'Writing {base}'
+
+        elif name == 'Edit':
+            path = inp.get('file_path', '')
+            base = os.path.basename(path) if path else 'file'
+            return f'Editing {base}'
+
+        elif name == 'Bash':
+            desc = inp.get('description', '')
+            if desc:
+                if len(desc) > 50:
+                    desc = desc[:47] + '\u2026'
+                return desc
+            cmd = inp.get('command', '')
+            if cmd:
+                cmd = cmd.split('\n')[0][:40]
+                return f'Running: {cmd}'
+            return 'Running command'
+
+        elif name == 'Grep':
+            pat = inp.get('pattern', '')
+            if pat and len(pat) < 30:
+                return f'Searching for \u201c{pat}\u201d'
+            return 'Searching codebase'
+
+        elif name == 'Glob':
+            pat = inp.get('pattern', '')
+            if pat and len(pat) < 30:
+                return f'Finding {pat}'
+            return 'Finding files'
+
+        elif name == 'Task':
+            desc = inp.get('description', '')
+            if desc:
+                if len(desc) > 40:
+                    desc = desc[:37] + '\u2026'
+                return f'Agent: {desc}'
+            return 'Running sub-agent'
+
+        elif name in ('TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet'):
+            return 'Managing tasks'
+
+        elif name == 'AskUserQuestion':
+            return 'Asking question'
+
+        elif name == 'WebSearch':
+            q = inp.get('query', '')
+            if q:
+                if len(q) > 35:
+                    q = q[:32] + '\u2026'
+                return f'Searching: {q}'
+            return 'Searching web'
+
+        elif name == 'WebFetch':
+            return 'Fetching web content'
+
+        elif name in ('EnterPlanMode', 'ExitPlanMode'):
+            return 'Planning'
+
+        elif name == 'NotebookEdit':
+            return 'Editing notebook'
+
+        elif name == 'Skill':
+            return 'Running skill'
+
+        else:
+            return f'Using {name}'
+
+    def _status_from_progress(self, entry):
+        """Extract status from a progress entry."""
+        data = entry.get('data', {})
+        ptype = data.get('type', '')
+
+        if ptype == 'bash_progress':
+            return 'Running command\u2026'
+        elif ptype == 'agent_progress':
+            return 'Sub-agent working\u2026'
+        elif ptype == 'hook_progress':
+            return 'Running hook\u2026'
+
+        return None
+
+    @property
+    def status(self):
+        with self._lock:
+            return self._status
+
+    def stop(self):
+        self._running = False
+
+
+# ─── Base Animation ──────────────────────────────────────────────────────────
+
+class BaseAnimation:
+    """Base class for all animation types.
+
+    Unified minimal aesthetic: only · . * + ✦ characters, sparse density,
+    mostly dim with few bold highlights.
+    """
+
+    def __init__(self, colors, manual_task, anim_name, activity=None):
+        self.colors = colors
+        self.manual_task = manual_task
+        self.name = anim_name
+        self.activity = activity
+        self.t = 0.0
+        self.start_time = None
+        self._size = (0, 0)
+
+    def _regenerate(self, h, w):
+        """Override to regenerate animation data on resize."""
+        pass
+
+    def _render_content(self, h, w, grid):
+        """Override to render animation content into the grid dict."""
+        pass
+
+    def render_frame(self):
+        h, w = get_term_size()
+        if h < 4 or w < 10:
+            return
+        if self.start_time is None:
+            self.start_time = time.time()
+        self.t = time.time() - self.start_time
+        self._regenerate(h, w)
+
+        grid = {}
+        self._render_content(h, w, grid)
+
+        # Fade-in: gradually reveal elements over 300ms
+        # Each cell gets a stable threshold based on position; it appears
+        # when the fade factor exceeds that threshold, so elements pop in
+        # spatially distributed rather than all at once.
+        fade = min(1.0, self.t / 0.3)
+        if fade < 1.0:
+            grid = {
+                (r, c): v for (r, c), v in grid.items()
+                if ((r * 7 + c * 13) % 100) / 100.0 < fade
+            }
+
+        # Build output
+        parts = ['\033[2J\033[?25l']
+        for (row, col), val in grid.items():
+            parts.append(f'\033[{row+1};{col+1}H{val}')
+
+        # Separator line above status bar
+        sep_row = h - 1
+        sep = '\u2500' * w
+        c0 = self.colors[0]
+        parts.append(f'\033[{sep_row};1H\033[2;38;5;{c0}m{sep}\033[0m')
+
+        # Determine current status text
+        if self.manual_task:
+            current_task = self.manual_task
+        elif self.activity and self.activity.status:
+            current_task = self.activity.status
+        else:
+            current_task = 'Claude Code'
+
+        # Status bar
+        elapsed = fmt_elapsed(time.time() - self.start_time)
+        dots = '\u00b7' * (1 + int(self.t * 2) % 3)
+        status = f' \u2726 {self.name} \u2500 {current_task} {dots}'
+        right = f'  {elapsed} '
+        fill = max(0, w - len(status) - len(right))
+        bar = f'{status}{" " * fill}{right}'
+        parts.append(f'\033[{h};1H\033[7;38;5;{c0}m{bar[:w]}\033[0m')
+
+        os.write(1, ''.join(parts).encode('utf-8'))
+
+
+# ─── 1. Spiral Galaxy ───────────────────────────────────────────────────────
+
+class SpiralGalaxy(BaseAnimation):
+    """Sparse dot spiral — points along three arms, bright ✦ core."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stars = []
+        self.bg_stars = []
+
+    def _regenerate(self, h, w):
+        if (h, w) == self._size and self.stars:
+            return
+        self._size = (h, w)
+        render_h = h - 2
+        n = min(80, w * render_h // 25)
+
+        self.stars = []
+        max_r = min(w * 0.4, render_h * 0.8)
+        for _ in range(n):
+            arm = random.randint(0, 2)
+            r = random.expovariate(1 / (max_r * 0.4))
+            a = arm * (2 * math.pi / 3) + r * 0.35 + random.gauss(0, 0.25)
+            char = random.choice(['\u00b7', '.', '*', '+'])
+            self.stars.append((r, a, char, random.random(), max_r))
+
+        self.bg_stars = [
+            (random.randint(0, render_h - 1), random.randint(0, w - 1),
+             random.choice(['\u00b7', '.']))
+            for _ in range(min(25, w * render_h // 80))
+        ]
+
+    def _render_content(self, h, w, grid):
+        render_h = h - 2
+        cx, cy = w // 2, render_h // 2
+        c_core, c_arm, c_outer = self.colors[0], self.colors[1], self.colors[2]
+
+        # Sparse background
+        for row, col, ch in self.bg_stars:
+            if 0 <= row < render_h and 0 <= col < w:
+                grid[(row, col)] = f'\033[2;38;5;{c_outer}m{ch}\033[0m'
+
+        # Spiral arm stars with color gradient
+        spin = self.t * 0.25
+        for r, angle, char, bright, max_r in self.stars:
+            a = angle + spin / (1 + r * 0.05)
+            x = int(cx + r * math.cos(a) * 1.8)
+            y = int(cy + r * math.sin(a))
+            if 0 <= y < render_h and 0 <= x < w:
+                frac = min(1.0, r / max(max_r, 1))
+                if frac < 0.25:
+                    cc = c_core
+                elif frac < 0.6:
+                    cc = c_arm
+                else:
+                    cc = c_outer
+                twinkle = 0.5 + 0.5 * math.sin(self.t * 2 + bright * 10)
+                if twinkle > 0.75 and bright > 0.6:
+                    grid[(y, x)] = f'\033[1;38;5;{cc}m{char}\033[0m'
+                else:
+                    grid[(y, x)] = f'\033[2;38;5;{cc}m{char}\033[0m'
+
+        # Bright core: ✦ center + a few nearby *
+        grid[(cy, cx)] = f'\033[1;38;5;{c_core}m\u2726\033[0m'
+        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1), (0, -2), (0, 2)]:
+            ny, nx = cy + dy, cx + dx
+            if 0 <= ny < render_h and 0 <= nx < w:
+                grid[(ny, nx)] = f'\033[1;38;5;{c_core}m*\033[0m'
+
+
+# ─── 2. Nebula ──────────────────────────────────────────────────────────────
+
+class Nebula(BaseAnimation):
+    """Scattered dot clouds that drift slowly — gaussian point clusters."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.blobs = []
+        self.bg_stars = []
+
+    def _regenerate(self, h, w):
+        if (h, w) == self._size and self.blobs:
+            return
+        self._size = (h, w)
+        render_h = h - 2
+        self.blobs = []
+        for _ in range(random.randint(5, 8)):
+            rx = random.uniform(w * 0.06, w * 0.18)
+            ry = random.uniform(render_h * 0.08, render_h * 0.22)
+            n_pts = random.randint(25, 55)
+            points = []
+            for _ in range(n_pts):
+                dx = random.gauss(0, rx * 0.5)
+                dy = random.gauss(0, ry * 0.5)
+                ch = random.choice(['\u00b7', '.', '\u00b7', '\u00b7', '.'])
+                points.append((dx, dy, ch, random.random()))
+            self.blobs.append({
+                'cx': random.uniform(0, w),
+                'cy': random.uniform(0, render_h),
+                'rx': rx, 'ry': ry,
+                'color': random.choice(self.colors),
+                'phase': random.uniform(0, 2 * math.pi),
+                'drift_x': random.uniform(-0.15, 0.15),
+                'drift_y': random.uniform(-0.08, 0.08),
+                'points': points,
+            })
+
+        self.bg_stars = [
+            (random.randint(0, render_h - 1), random.randint(0, w - 1))
+            for _ in range(min(20, w * render_h // 100))
+        ]
+
+    def _render_content(self, h, w, grid):
+        render_h = h - 2
+
+        # Dim background dots
+        for row, col in self.bg_stars:
+            if 0 <= row < render_h and 0 <= col < w:
+                grid[(row, col)] = '\033[2;38;5;240m\u00b7\033[0m'
+
+        # Cloud blobs — point-based rendering
+        for b in self.blobs:
+            bcx = (b['cx'] + b['drift_x'] * self.t * 8 +
+                   math.sin(self.t * 0.3 + b['phase']) * b['rx'] * 0.25)
+            bcy = (b['cy'] + b['drift_y'] * self.t * 8 +
+                   math.cos(self.t * 0.25 + b['phase']) * b['ry'] * 0.2)
+            bcx = bcx % w
+            bcy = bcy % render_h
+
+            for dx, dy, ch, bright in b['points']:
+                pc = int(bcx + dx) % w
+                pr = int(bcy + dy) % render_h
+                if 0 <= pr < render_h and 0 <= pc < w:
+                    dist = math.sqrt(
+                        (dx / max(b['rx'], 1)) ** 2 +
+                        (dy / max(b['ry'], 1)) ** 2
+                    )
+                    if dist < 1.5:
+                        twinkle = 0.5 + 0.5 * math.sin(
+                            self.t * 1.2 + bright * 8)
+                        if dist < 0.4 and twinkle > 0.5:
+                            grid[(pr, pc)] = (
+                                f'\033[38;5;{b["color"]}m{ch}\033[0m')
+                        else:
+                            grid[(pr, pc)] = (
+                                f'\033[2;38;5;{b["color"]}m{ch}\033[0m')
+
+
+# ─── 3. Meteor Shower ───────────────────────────────────────────────────────
+
+class MeteorShower(BaseAnimation):
+    """Thin shooting-star streaks: ✦ * + · · . . fading to nothing."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.meteors = []
+        self.bg_stars = []
+
+    def _regenerate(self, h, w):
+        if (h, w) == self._size and self.bg_stars:
+            return
+        self._size = (h, w)
+        render_h = h - 2
+        self.meteors = []
+        self.bg_stars = [
+            (random.randint(0, render_h - 1), random.randint(0, w - 1),
+             random.choice(['\u00b7', '.']))
+            for _ in range(min(40, w * render_h // 40))
+        ]
+
+    def _render_content(self, h, w, grid):
+        render_h = h - 2
+
+        # Background stars with subtle twinkle
+        for row, col, ch in self.bg_stars:
+            if 0 <= row < render_h and 0 <= col < w:
+                twinkle = 0.5 + 0.5 * math.sin(
+                    self.t * 1.5 + row * 0.7 + col * 0.3)
+                if twinkle > 0.4:
+                    grid[(row, col)] = f'\033[2;38;5;255m{ch}\033[0m'
+
+        # Spawn new meteors
+        if random.random() < 0.25:
+            self.meteors.append({
+                'x': random.randint(w // 4, w + 5),
+                'y': random.randint(-3, -1),
+                'speed': random.uniform(2.0, 4.0),
+                'length': random.randint(4, 8),
+                'color_idx': random.randint(0, len(self.colors) - 1),
+                'age': 0.0,
+            })
+
+        # Render streaks
+        trail_chars = ['\u2726', '*', '+', '\u00b7', '\u00b7', '.', '.']
+        alive = []
+        for m in self.meteors:
+            m['age'] += 0.04
+            mx = m['x'] - m['age'] * m['speed'] * 18
+            my = m['y'] + m['age'] * m['speed'] * 9
+
+            visible = False
+            for i in range(m['length']):
+                tx = int(mx + i * 1.5)
+                ty = int(my - i * 0.7)
+                if 0 <= ty < render_h and 0 <= tx < w:
+                    visible = True
+                    ch = trail_chars[min(i, len(trail_chars) - 1)]
+                    ci = min(len(self.colors) - 1, m['color_idx'] + i // 3)
+                    cc = self.colors[ci]
+                    if i < 2:
+                        grid[(ty, tx)] = f'\033[1;38;5;{cc}m{ch}\033[0m'
+                    else:
+                        grid[(ty, tx)] = f'\033[2;38;5;{cc}m{ch}\033[0m'
+
+            if visible or m['age'] < 2.5:
+                alive.append(m)
+
+        self.meteors = alive[:40]
+
+
+# ─── 4. Pulsar ───────────────────────────────────────────────────────────────
+
+class Pulsar(BaseAnimation):
+    """Expanding dot rings with a rotating beam — clean geometric feel."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.rings = []
+
+    def _regenerate(self, h, w):
+        if (h, w) == self._size:
+            return
+        self._size = (h, w)
+        self.rings = []
+
+    def _render_content(self, h, w, grid):
+        render_h = h - 2
+        cx, cy = w / 2, render_h / 2
+        max_r = min(w / 2, render_h) * 0.8
+
+        # Spawn new rings periodically
+        if not self.rings or self.rings[-1]['r'] > 3:
+            if int(self.t * 25) % 10 == 0 or not self.rings:
+                self.rings.append({'r': 0.5, 'birth': self.t})
+
+        beam_angle = self.t * 1.2
+
+        # Draw rings as spaced dots
+        for ring in self.rings:
+            r = ring['r']
+            age = self.t - ring['birth']
+            fade = max(0, 1.0 - age * 0.12)
+            if fade <= 0.05:
+                continue
+
+            ci = int(age * 0.4) % len(self.colors)
+            cc = self.colors[ci]
+
+            n_points = max(8, int(r * 3))
+            for j in range(n_points):
+                a = 2 * math.pi * j / n_points
+                px = int(cx + r * math.cos(a) * 1.8)
+                py = int(cy + r * math.sin(a))
+                if 0 <= py < render_h and 0 <= px < w:
+                    angle_diff = abs(
+                        ((a - beam_angle + math.pi) % (2 * math.pi))
+                        - math.pi)
+                    if angle_diff < 0.2:
+                        grid[(py, px)] = f'\033[1;38;5;{cc}m+\033[0m'
+                    elif fade > 0.5:
+                        grid[(py, px)] = f'\033[38;5;{cc}m\u00b7\033[0m'
+                    else:
+                        grid[(py, px)] = f'\033[2;38;5;{cc}m\u00b7\033[0m'
+
+        # Rotating beam lines (both directions)
+        for d in range(1, int(max_r)):
+            for sign in (1, -1):
+                bx = int(cx + sign * d * math.cos(beam_angle) * 1.8)
+                by = int(cy + sign * d * math.sin(beam_angle))
+                if 0 <= by < render_h and 0 <= bx < w:
+                    cc = self.colors[0] if sign > 0 else self.colors[-1]
+                    ch = '*' if d % 4 == 0 else '+'
+                    dim = '' if d < max_r * 0.5 else '2;'
+                    grid[(by, bx)] = f'\033[{dim}38;5;{cc}m{ch}\033[0m'
+
+        # Center pulses between ✦ and *
+        pulse = 0.5 + 0.5 * math.sin(self.t * 4)
+        ch = '\u2726' if pulse > 0.5 else '*'
+        cc = self.colors[0]
+        icx, icy = int(cx), int(cy)
+        if 0 <= icy < render_h and 0 <= icx < w:
+            grid[(icy, icx)] = f'\033[1;38;5;{cc}m{ch}\033[0m'
+
+        # Expand rings and prune
+        alive = []
+        for ring in self.rings:
+            ring['r'] += 0.4
+            if self.t - ring['birth'] < 10.0 and ring['r'] < max_r * 1.2:
+                alive.append(ring)
+        self.rings = alive
+
+
+# ─── 5. Aurora ───────────────────────────────────────────────────────────────
+
+class Aurora(BaseAnimation):
+    """Wavy horizontal bands of sparse · dots with gentle sine motion."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.bands = []
+        self.bg_stars = []
+
+    def _regenerate(self, h, w):
+        if (h, w) == self._size and self.bands:
+            return
+        self._size = (h, w)
+        render_h = h - 2
+        n_bands = random.randint(3, 5)
+        self.bands = []
+        for i in range(n_bands):
+            self.bands.append({
+                'base_y': render_h * (0.2 + 0.6 * i / max(n_bands - 1, 1)),
+                'color': self.colors[i % len(self.colors)],
+                'amplitude': random.uniform(1.5, 3.5),
+                'freq': random.uniform(0.03, 0.07),
+                'phase': random.uniform(0, 2 * math.pi),
+                'width': random.uniform(1.5, 3.0),
+            })
+
+        # Stable background star positions
+        random.seed(42)
+        self.bg_stars = [
+            (random.randint(0, render_h - 1), random.randint(0, w - 1))
+            for _ in range(min(25, w * render_h // 60))
+        ]
+        random.seed()
+
+    def _render_content(self, h, w, grid):
+        render_h = h - 2
+
+        # Background stars
+        for row, col in self.bg_stars:
+            if 0 <= row < render_h and 0 <= col < w:
+                twinkle = 0.5 + 0.5 * math.sin(self.t * 1.2 + row + col)
+                if twinkle > 0.5:
+                    grid[(row, col)] = '\033[2;38;5;255m\u00b7\033[0m'
+
+        # Aurora bands — sparse dots at varying density
+        for col in range(w):
+            for band in self.bands:
+                wave_y = (band['base_y'] +
+                          band['amplitude'] * math.sin(
+                              col * band['freq'] + self.t * 0.6 +
+                              band['phase']) +
+                          band['amplitude'] * 0.4 * math.sin(
+                              col * band['freq'] * 2.1 + self.t * 0.9))
+
+                half_w = (band['width'] +
+                          0.3 * math.sin(self.t * 0.4 + col * 0.01))
+
+                for dy_i in range(int(-half_w - 1), int(half_w + 2)):
+                    row = int(wave_y + dy_i)
+                    if 0 <= row < render_h:
+                        dist = abs(dy_i) / max(half_w, 0.1)
+                        intensity = max(0, 1.0 - dist)
+                        if intensity < 0.1:
+                            continue
+                        # Sparse: deterministic noise for stable dot placement
+                        noise = (math.sin(col * 13.7 + row * 7.3 +
+                                          self.t * 0.5) * 0.5 + 0.5)
+                        threshold = 0.96 - intensity * 0.1
+                        if noise > threshold:
+                            cc = band['color']
+                            if intensity > 0.7:
+                                grid[(row, col)] = (
+                                    f'\033[38;5;{cc}m\u00b7\033[0m')
+                            else:
+                                grid[(row, col)] = (
+                                    f'\033[2;38;5;{cc}m\u00b7\033[0m')
+
+
+# ─── 6. Wormhole ─────────────────────────────────────────────────────────────
+
+class Wormhole(BaseAnimation):
+    """Concentric dot ellipses with inward-spiraling particles."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.particles = []
+
+    def _regenerate(self, h, w):
+        if (h, w) == self._size and self.particles:
+            return
+        self._size = (h, w)
+        self.particles = []
+        for _ in range(min(60, w * h // 25)):
+            self.particles.append({
+                'angle': random.uniform(0, 2 * math.pi),
+                'r': random.uniform(0.2, 1.0),
+                'speed': random.uniform(0.005, 0.018),
+                'char': random.choice(['\u00b7', '.', '*', '+', '\u2726']),
+            })
+
+    def _render_content(self, h, w, grid):
+        render_h = h - 2
+        cx, cy = w / 2, render_h / 2
+        max_rx = w * 0.42
+        max_ry = render_h * 0.42
+        rotation = self.t * 0.3
+
+        # Concentric ellipses drawn with spaced · dots
+        n_rings = 7
+        for ring_i in range(n_rings):
+            frac = (ring_i + 1) / n_rings
+            scale = 0.12 + 0.88 * frac
+            rx = max_rx * scale
+            ry = max_ry * scale
+            rot = rotation + ring_i * 0.12
+
+            ci = ring_i % len(self.colors)
+            cc = self.colors[ci]
+            fade = 0.3 + 0.7 * frac
+
+            n_points = max(12, int(24 * scale))
+            for j in range(n_points):
+                a = 2 * math.pi * j / n_points + rot
+                ex = rx * math.cos(a)
+                ey = ry * math.sin(a)
+                cos_r = math.cos(rotation * 0.2)
+                sin_r = math.sin(rotation * 0.2)
+                px = ex * cos_r - ey * sin_r * 0.3
+                py = ex * sin_r * 0.3 + ey * cos_r
+                pc = int(cx + px)
+                pr = int(cy + py)
+                if 0 <= pr < render_h and 0 <= pc < w:
+                    dim = '' if fade > 0.6 else '2;'
+                    grid[(pr, pc)] = f'\033[{dim}38;5;{cc}m\u00b7\033[0m'
+
+        # Particles spiraling inward
+        for p in self.particles:
+            p['r'] -= p['speed']
+            if p['r'] <= 0.02:
+                p['r'] = random.uniform(0.8, 1.0)
+                p['angle'] = random.uniform(0, 2 * math.pi)
+
+            a = p['angle'] + rotation + (1.0 - p['r']) * 2.0
+            r = p['r']
+            px = cx + max_rx * r * math.cos(a)
+            py = cy + max_ry * r * math.sin(a) * 0.7
+            pc = int(px)
+            pr = int(py)
+            if 0 <= pr < render_h and 0 <= pc < w:
+                ci = int((1.0 - r) * len(self.colors)) % len(self.colors)
+                cc = self.colors[ci]
+                if r < 0.3:
+                    grid[(pr, pc)] = (
+                        f'\033[1;38;5;{cc}m{p["char"]}\033[0m')
+                else:
+                    grid[(pr, pc)] = (
+                        f'\033[2;38;5;{cc}m{p["char"]}\033[0m')
+
+        # Center singularity: single ✦
+        icx, icy = int(cx), int(cy)
+        if 0 <= icy < render_h and 0 <= icx < w:
+            pulse_c = self.colors[int(self.t * 3) % len(self.colors)]
+            grid[(icy, icx)] = f'\033[1;38;5;{pulse_c}m\u2726\033[0m'
+
+
+# ─── Animation class lookup ─────────────────────────────────────────────────
+
+ANIM_CLASSES = {
+    'SpiralGalaxy': SpiralGalaxy,
+    'Nebula': Nebula,
+    'MeteorShower': MeteorShower,
+    'Pulsar': Pulsar,
+    'Aurora': Aurora,
+    'Wormhole': Wormhole,
+}
+
+
+# ─── Focus Event Parsing ─────────────────────────────────────────────────────
+
+def parse_focus_events(data):
+    """Strip terminal focus event sequences from input data.
+
+    When focus reporting is enabled (\\033[?1004h), the terminal sends:
+      \\033[I  on focus-in
+      \\033[O  on focus-out
+
+    Returns (cleaned_data, focus_state) where focus_state is:
+      True  if last event was focus-in
+      False if last event was focus-out
+      None  if no focus events were present
+    """
+    focus_state = None
+    cleaned = bytearray()
+    i = 0
+    n = len(data)
+    while i < n:
+        if (i + 2 < n and data[i] == 0x1b and data[i + 1] == 0x5b
+                and data[i + 2] in (0x49, 0x4f)):
+            focus_state = (data[i + 2] == 0x49)  # I=focus-in, O=focus-out
+            i += 3
+        else:
+            cleaned.append(data[i])
+            i += 1
+    return bytes(cleaned), focus_state
+
+
+# ─── Argument Parsing ────────────────────────────────────────────────────────
+
+def parse_args(argv):
+    """Parse stardust arguments.
+
+    Returns (task, command) where:
+      task    — string task description or None
+      command — list of command + args to exec (default: ['claude'])
+
+    Supports:
+      stardust                              → task=None,  cmd=['claude']
+      stardust "fix bug"                    → task="fix bug", cmd=['claude']
+      stardust "fix bug" -- claude --model  → task="fix bug", cmd=['claude','--model']
+      stardust -- my-cmd --flag             → task=None,  cmd=['my-cmd','--flag']
+    """
+    args = argv[1:]
+
+    if '--help' in args or '-h' in args:
+        print(HELP_TEXT)
+        sys.exit(0)
+
+    if '--' in args:
+        sep = args.index('--')
+        before = args[:sep]
+        after = args[sep + 1:]
+        task = ' '.join(before) if before else None
+        command = after if after else ['claude']
+    else:
+        task = ' '.join(args) if args else None
+        command = ['claude']
+
+    return task, command
+
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+def main():
+    manual_task, command = parse_args(sys.argv)
+
+    anim_def = random.choice(ANIMATIONS)
+    anim_name = anim_def['name']
+    anim_cls = ANIM_CLASSES[anim_def['class']]
+    primary_color = anim_def['colors'][0]
+
+    # Banner
+    banner_task = manual_task if manual_task else 'waiting for first message...'
+    banner = (f'\033[38;5;{primary_color}m\u2726 {anim_name} '
+              f'\u2500 {banner_task}\033[0m\n')
+    os.write(1, banner.encode('utf-8'))
+
+    # Set terminal tab title so it's visible in the tab bar
+    tab_title = f'\u2726 {banner_task}'
+    os.write(1, f'\033]0;{tab_title}\007'.encode('utf-8'))
+
+    # Start activity detection thread
+    activity = ActivityDetector()
+
+    # Build the command to exec
+    exec_cmd = list(command)
+    if manual_task and exec_cmd[0] == 'claude':
+        exec_cmd.append(manual_task)
+
+    # Fork with PTY
+    child_pid, master_fd = pty.fork()
+    if child_pid == 0:
+        os.execvp(exec_cmd[0], exec_cmd)
+        sys.exit(1)
+
+    copy_term_size(0, master_fd)
+    old_attrs = termios.tcgetattr(0)
+
+    def handle_winch(_sig, _frame):
+        copy_term_size(0, master_fd)
+        try:
+            os.kill(child_pid, signal.SIGWINCH)
+        except ProcessLookupError:
+            pass
+
+    signal.signal(signal.SIGWINCH, handle_winch)
+
+    try:
+        tty.setraw(0)
+
+        # Enable terminal focus reporting — terminal sends \033[I / \033[O
+        os.write(1, b'\033[?1004h')
+
+        anim = anim_cls(
+            anim_def['colors'], manual_task, anim_name,
+            activity=activity,
+        )
+        focused = True
+        overlay_active = False
+        last_frame_time = 0.0
+        pending_output = bytearray()
+
+        while True:
+            timeout = 0.033 if overlay_active else 0.1
+            try:
+                rlist, _, _ = select.select([0, master_fd], [], [], timeout)
+            except (InterruptedError, ValueError, OSError):
+                break
+
+            now = time.time()
+
+            # Always drain child output to prevent blocking
+            if master_fd in rlist:
+                try:
+                    data = os.read(master_fd, 16384)
+                except OSError:
+                    break
+                if not data:
+                    break
+                if overlay_active:
+                    pending_output.extend(data)
+                else:
+                    os.write(1, data)
+
+            # Read stdin — parse focus events, forward the rest to child
+            if 0 in rlist:
+                try:
+                    data = os.read(0, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+
+                cleaned, focus_state = parse_focus_events(data)
+
+                if focus_state is not None:
+                    if focused and not focus_state:
+                        # Lost focus → overlay on alternate screen
+                        overlay_active = True
+                        os.write(1, b'\033[?1049h')
+                        anim.t = 0.0
+                        anim.start_time = None
+                        anim._size = (0, 0)
+                    elif not focused and focus_state:
+                        # Regained focus → restore original screen
+                        overlay_active = False
+                        os.write(1, b'\033[?1049l')
+                        if pending_output:
+                            os.write(1, bytes(pending_output))
+                            pending_output.clear()
+                        os.write(1, b'\033[?25h')
+                        copy_term_size(0, master_fd)
+                        try:
+                            os.kill(child_pid, signal.SIGWINCH)
+                        except ProcessLookupError:
+                            break
+                    focused = focus_state
+
+                if cleaned:
+                    try:
+                        os.write(master_fd, cleaned)
+                    except OSError:
+                        break
+
+            # Render animation at ~30fps when overlay is active
+            if overlay_active and now - last_frame_time >= 0.033:
+                last_frame_time = now
+                try:
+                    anim.render_frame()
+                except Exception:
+                    pass
+
+    finally:
+        activity.stop()
+
+        # Disable focus reporting and restore screen
+        os.write(1, b'\033[?1004l')
+
+        if overlay_active:
+            os.write(1, b'\033[?1049l')
+            if pending_output:
+                os.write(1, bytes(pending_output))
+
+        termios.tcsetattr(0, termios.TCSADRAIN, old_attrs)
+        os.write(1, b'\033[?25h')
+        # Reset tab title
+        os.write(1, b'\033]0;\007')
+
+        try:
+            _, status = os.waitpid(child_pid, 0)
+            code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+        except ChildProcessError:
+            code = 0
+        sys.exit(code)
+
+
+if __name__ == '__main__':
+    main()
