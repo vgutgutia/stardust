@@ -1150,7 +1150,9 @@ def main():
             timeout = 0.033 if overlay_active else 0.1
             try:
                 rlist, _, _ = select.select([0, master_fd], [], [], timeout)
-            except (InterruptedError, ValueError, OSError):
+            except InterruptedError:
+                continue
+            except (ValueError, OSError):
                 break
 
             now = time.time()
@@ -1159,6 +1161,8 @@ def main():
             if master_fd in rlist:
                 try:
                     data = os.read(master_fd, 16384)
+                except InterruptedError:
+                    continue
                 except OSError:
                     break
                 if not data:
@@ -1172,6 +1176,8 @@ def main():
             if 0 in rlist:
                 try:
                     data = os.read(0, 4096)
+                except InterruptedError:
+                    continue
                 except OSError:
                     break
                 if not data:
@@ -1219,6 +1225,8 @@ def main():
                 if cleaned:
                     try:
                         os.write(master_fd, cleaned)
+                    except InterruptedError:
+                        continue
                     except OSError:
                         break
 
